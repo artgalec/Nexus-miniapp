@@ -3,7 +3,8 @@ import re
 import html
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from aiohttp import web, ClientSession
 import feedparser
 
@@ -11,19 +12,20 @@ logging.basicConfig(level=logging.INFO)
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 
-# 1. ОФИЦИАЛЬНЫЕ TELEGRAM-КАНАЛЫ (username без @)
+# ОФИЦИАЛЬНЫЕ И ПРОФИЛЬНЫЕ TELEGRAM-КАНАЛЫ БРЕНДОВ (username без @)
 TG_CHANNELS = [
-    {"name": "Xiaomi Official", "brand": "Xiaomi", "username": "xiaomi"},
+    {"name": "Xiaomi Global", "brand": "Xiaomi", "username": "XiaomiGlobalOfficial"},
+    {"name": "Xiaomi Россия", "brand": "Xiaomi", "username": "xiaomirussia"},
     {"name": "Samsung Newsroom", "brand": "Samsung", "username": "samsungnewsroom"},
-    {"name": "OPPO Global", "brand": "OPPO", "username": "oppoglobal"},
+    {"name": "Samsung Russia", "brand": "Samsung", "username": "Samsung_Russia"},
+    {"name": "OPPO Россия", "brand": "OPPO", "username": "opporussia"},
     {"name": "Huawei Mobile", "brand": "Huawei", "username": "HuaweiMobile"},
+    {"name": "Huawei Россия", "brand": "Huawei", "username": "huaweimobilerus"},
     {"name": "Nothing", "brand": "Nothing", "username": "nothing"},
-    {"name": "vivo Global", "brand": "vivo", "username": "vivoglobal"},
-    {"name": "Telegram News", "brand": "Другое", "username": "telegram"},
-    {"name": "Rozetked", "brand": "Другое", "username": "rozetked"},
+    {"name": "vivo Россия", "brand": "vivo", "username": "vivorussia"},
 ]
 
-# 2. ОФИЦИАЛЬНЫЕ СТРАНИЦЫ INSTAGRAM (username без @)
+# ОФИЦИАЛЬНЫЕ СТРАНИЦЫ INSTAGRAM (username без @)
 IG_PROFILES = [
     {"name": "Xiaomi Global", "brand": "Xiaomi", "username": "xiaomi.global"},
     {"name": "Samsung", "brand": "Samsung", "username": "samsung"},
@@ -33,7 +35,6 @@ IG_PROFILES = [
     {"name": "vivo", "brand": "vivo", "username": "vivo_global"},
 ]
 
-# Зеркала RSSHub для публичных постов Instagram
 RSSHUB_MIRRORS = [
     "https://rsshub.app",
     "https://rsshub.rssforever.com",
@@ -42,16 +43,27 @@ RSSHUB_MIRRORS = [
 
 news_cache = []
 last_updated = "Только что"
+LOCAL_TZ = timezone(timedelta(hours=3))  # Минск / Москва (UTC+3)
 
 def clean_html(raw_html: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", raw_html or "")
+    text = re.sub(r"<br\s*/?>", " ", raw_html or "", flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
-def make_quick_summary(text: str, max_len: int = 200) -> str:
+def format_time_label(dt: datetime) -> str:
+    local_dt = dt.astimezone(LOCAL_TZ)
+    now = datetime.now(LOCAL_TZ)
+    if local_dt.date() == now.date():
+        return f"Сегодня, {local_dt.strftime('%H:%M')}"
+    if local_dt.date() == (now - timedelta(days=1)).date():
+        return f"Вчера, {local_dt.strftime('%H:%M')}"
+    return local_dt.strftime("%d.%m в %H:%M")
+
+def make_quick_summary(text: str, max_len: int = 210) -> str:
     cleaned = clean_html(text)
     if not cleaned:
-        return "Откройте пост в источнике, чтобы посмотреть фото и полный текст."
+        return "Откройте пост в источнике, чтобы посмотреть фото и детали."
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[:max_len].rsplit(" ", 1)[0] + "..."
@@ -77,22 +89,40 @@ async def ai_summarize(title: str, text: str, session: ClientSession) -> str:
 
 async def fetch_tg_channel(channel: dict, session: ClientSession) -> list:
     items = []
-    url = f"https://t.me/s/{channel['username']}"
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}
+    # Добавляем случайный query-параметр, чтобы сервер не отдавал закешированную страницу
+    url = f"https://t.me/s/{channel['username']}?t={int(datetime.now().timestamp())}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+        "Cache-Control": "no-cache"
+    }
     try:
         async with session.get(url, headers=headers, timeout=12) as resp:
             if resp.status != 200:
                 return items
             page = await resp.text()
-        blocks = re.findall(
-            r'data-post="([^"]+)"[\s\S]*?<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)</div>',
-            page
-        )
-        for post_id, raw_msg in blocks[-3:]:
-            cleaned = clean_html(raw_msg)
-            if len(cleaned) < 25:
+
+        # Разбиваем страницу на отдельные сообщения с датой <time datetime="...">
+        msg_chunks = page.split('class="tgme_widget_message_wrap')
+        for chunk in msg_chunks[1:]:
+            post_match = re.search(r'data-post="([^"]+)"', chunk)
+            time_match = re.search(r'<time[^>]+datetime="([^"]+)"', chunk)
+            text_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)</div>', chunk)
+
+            if not post_match or not time_match:
                 continue
-            title = cleaned[:75].rsplit(" ", 1)[0] + "..." if len(cleaned) > 75 else cleaned
+
+            post_id = post_match.group(1)
+            raw_time = time_match.group(1)
+            try:
+                dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            except Exception:
+                dt = datetime.now(timezone.utc)
+
+            cleaned = clean_html(text_match.group(1)) if text_match else ""
+            if len(cleaned) < 12:
+                continue
+
+            title = cleaned[:80].rsplit(" ", 1)[0] + "..." if len(cleaned) > 80 else cleaned
             summary = await ai_summarize(title, cleaned, session)
             items.append({
                 "title": title,
@@ -102,21 +132,26 @@ async def fetch_tg_channel(channel: dict, session: ClientSession) -> list:
                 "platform": "Telegram",
                 "summary": summary,
                 "url": f"https://t.me/{post_id}",
-                "time": "Telegram"
+                "timestamp": dt.timestamp(),
+                "time": format_time_label(dt),
+                "is_fresh": (datetime.now(timezone.utc) - dt).total_seconds() <= 86400
             })
     except Exception as e:
         logging.warning("TG error %s: %s", channel["username"], e)
-    return items
+
+    # Берём 5 самых последних постов из канала
+    items.sort(key=lambda x: x["timestamp"], reverse=True)
+    return items[:5]
 
 async def fetch_ig_profile(profile: dict, session: ClientSession) -> list:
     items = []
-    headers = {"User-Agent": "Mozilla/5.0 (NexusAI News Reader)"}
+    headers = {"User-Agent": "Mozilla/5.0 (NexusAI News Reader)", "Cache-Control": "no-cache"}
     xml_text = ""
 
     for mirror in RSSHUB_MIRRORS:
         rss_url = f"{mirror}/instagram/user/{profile['username']}"
         try:
-            async with session.get(rss_url, headers=headers, timeout=10) as resp:
+            async with session.get(rss_url, headers=headers, timeout=9) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     if "<rss" in text or "<feed" in text:
@@ -129,12 +164,21 @@ async def fetch_ig_profile(profile: dict, session: ClientSession) -> list:
         return items
 
     feed = feedparser.parse(xml_text)
-    for entry in feed.entries[:3]:
+    for entry in feed.entries[:4]:
         raw_desc = entry.get("summary", "") or entry.get("description", "") or entry.get("title", "")
         cleaned = clean_html(raw_desc)
         if not cleaned:
             cleaned = f"Новая публикация в официальном аккаунте @{profile['username']}"
-        title = cleaned[:75].rsplit(" ", 1)[0] + "..." if len(cleaned) > 75 else cleaned
+
+        pub_str = entry.get("published") or entry.get("updated") or ""
+        try:
+            dt = parsedate_to_datetime(pub_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            dt = datetime.now(timezone.utc)
+
+        title = cleaned[:80].rsplit(" ", 1)[0] + "..." if len(cleaned) > 80 else cleaned
         summary = await ai_summarize(title, cleaned, session)
         post_url = entry.get("link") or f"https://www.instagram.com/{profile['username']}/"
         items.append({
@@ -145,7 +189,9 @@ async def fetch_ig_profile(profile: dict, session: ClientSession) -> list:
             "platform": "Instagram",
             "summary": summary,
             "url": post_url,
-            "time": "Instagram"
+            "timestamp": dt.timestamp(),
+            "time": format_time_label(dt),
+            "is_fresh": (datetime.now(timezone.utc) - dt).total_seconds() <= 86400
         })
     return items
 
@@ -157,18 +203,19 @@ async def refresh_all_news():
         results = await asyncio.gather(*tasks)
 
     combined = []
-    max_len = max((len(r) for r in results), default=0)
-    for i in range(max_len):
-        for group in results:
-            if i < len(group):
-                item = group[i]
-                item["id"] = f"{item['platform']}_{i}_{len(combined)}"
-                combined.append(item)
+    for group in results:
+        combined.extend(group)
+
+    # Строгая сортировка всей ленты от самых свежих постов к старым
+    combined.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    for idx, item in enumerate(combined):
+        item["id"] = f"{item['platform']}_{idx}"
 
     if combined:
         news_cache = combined
-        last_updated = datetime.now().strftime("%H:%M")
-        logging.info("Собрано постов: %d", len(news_cache))
+        last_updated = datetime.now(LOCAL_TZ).strftime("%H:%M")
+        logging.info("Обновлено и отсортировано по свежести: %d постов", len(news_cache))
 
 async def handle_index(request):
     html_content = """
@@ -178,7 +225,7 @@ async def handle_index(request):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <meta name="theme-color" content="#090d16">
-        <title>NexusAI — Mobile Tech Feed</title>
+        <title>NexusAI — Свежие новости брендов</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script>
             tailwind.config = { darkMode: 'class' };
@@ -199,10 +246,10 @@ async def handle_index(request):
                     <div class="flex items-center gap-2">
                         <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
                         <h1 class="text-lg font-extrabold tracking-tight bg-gradient-to-r from-sky-400 via-blue-500 to-pink-500 bg-clip-text text-transparent">
-                            NexusAI Tech Feed
+                            NexusAI Live Feed
                         </h1>
                     </div>
-                    <p id="status-text" class="text-[11px] text-slate-500 dark:text-slate-400">Загрузка официальных страниц...</p>
+                    <p id="status-text" class="text-[11px] text-slate-500 dark:text-slate-400">Поиск свежих публикаций...</p>
                 </div>
                 <div class="flex items-center gap-2">
                     <button onclick="toggleTheme()" class="p-2 rounded-xl bg-slate-200/70 dark:bg-slate-800 text-xs font-bold">🌓</button>
@@ -213,11 +260,12 @@ async def handle_index(request):
             </div>
 
             <div id="feed-controls" class="max-w-md mx-auto px-4 pb-3 space-y-2">
-                <input id="search-input" oninput="applyFilters()" type="search" placeholder="Поиск по брендам, моделям и тексту..."
+                <input id="search-input" oninput="applyFilters()" type="search" placeholder="Поиск по моделям, брендам и тексту..."
                     class="w-full bg-slate-100 dark:bg-[#131a29] border border-slate-200 dark:border-slate-800 rounded-xl px-3.5 py-2 text-sm placeholder-slate-400 focus:outline-none focus:border-blue-500">
                 
-                <!-- Фильтр по соцсетям -->
+                <!-- Фильтр по времени и соцсетям -->
                 <div class="flex gap-1.5 overflow-x-auto no-scrollbar">
+                    <button id="fresh-btn" onclick="toggleFreshOnly()" class="px-3 py-1 rounded-full text-xs font-semibold bg-slate-200/70 dark:bg-[#131a29] text-slate-600 dark:text-slate-300 whitespace-nowrap">🔥 За 24 часа</button>
                     <button onclick="setPlatform('Все')" class="plat-btn px-3 py-1 rounded-full text-xs font-semibold bg-blue-600 text-white whitespace-nowrap">Все сети</button>
                     <button onclick="setPlatform('Telegram')" class="plat-btn px-3 py-1 rounded-full text-xs font-semibold bg-slate-200/70 dark:bg-[#131a29] text-slate-600 dark:text-slate-300 whitespace-nowrap">✈️ Telegram</button>
                     <button onclick="setPlatform('Instagram')" class="plat-btn px-3 py-1 rounded-full text-xs font-semibold bg-slate-200/70 dark:bg-[#131a29] text-slate-600 dark:text-slate-300 whitespace-nowrap">📸 Instagram</button>
@@ -244,7 +292,7 @@ async def handle_index(request):
             <div class="max-w-md mx-auto flex justify-around py-2">
                 <button id="tab-feed" onclick="switchTab('feed')" class="flex flex-col items-center gap-0.5 text-blue-500 font-semibold text-xs px-6 py-1">
                     <span class="text-base">📰</span>
-                    <span>Лента</span>
+                    <span>Свежее</span>
                 </button>
                 <button id="tab-saved" onclick="switchTab('saved')" class="flex flex-col items-center gap-0.5 text-slate-400 font-medium text-xs px-6 py-1">
                     <span class="text-base">🔖</span>
@@ -257,6 +305,7 @@ async def handle_index(request):
             let allNews = [];
             let currentPlatform = 'Все';
             let currentBrand = 'Все';
+            let freshOnly = false;
             let currentTab = 'feed';
             let savedItems = JSON.parse(localStorage.getItem('nexus_social_saved') || '[]');
 
@@ -266,6 +315,15 @@ async def handle_index(request):
 
             function toggleTheme() {
                 document.documentElement.classList.toggle('dark');
+            }
+
+            function toggleFreshOnly() {
+                freshOnly = !freshOnly;
+                const btn = document.getElementById('fresh-btn');
+                btn.className = freshOnly
+                    ? 'px-3 py-1 rounded-full text-xs font-semibold bg-emerald-600 text-white whitespace-nowrap'
+                    : 'px-3 py-1 rounded-full text-xs font-semibold bg-slate-200/70 dark:bg-[#131a29] text-slate-600 dark:text-slate-300 whitespace-nowrap';
+                applyFilters();
             }
 
             function switchTab(tab) {
@@ -307,10 +365,11 @@ async def handle_index(request):
                 btn.disabled = true;
                 btn.classList.add('opacity-60');
                 if (!allNews.length) {
-                    list.innerHTML = '<div class="text-center py-16 text-slate-400 text-sm">Собираем новости брендов из Telegram и Instagram...</div>';
+                    list.innerHTML = '<div class="text-center py-16 text-slate-400 text-sm">Собираем самые свежие посты...</div>';
                 }
                 try {
-                    const res = await fetch(force ? '/api/refresh' : '/api/news');
+                    const url = (force ? '/api/refresh' : '/api/news') + '?t=' + Date.now();
+                    const res = await fetch(url);
                     const data = await res.json();
                     allNews = data.items || [];
                     document.getElementById('status-text').innerText = `Обновлено в ${data.updated} • ${allNews.length} постов`;
@@ -324,7 +383,7 @@ async def handle_index(request):
             }
 
             function forceRefresh() {
-                document.getElementById('status-text').innerText = 'Обновление официальных страниц...';
+                document.getElementById('status-text').innerText = 'Запрашиваем свежие посты...';
                 loadNews(true);
             }
 
@@ -353,6 +412,7 @@ async def handle_index(request):
             function applyFilters() {
                 const query = document.getElementById('search-input').value.toLowerCase().trim();
                 const filtered = allNews.filter(item => {
+                    const matchFresh = !freshOnly || item.is_fresh;
                     const matchPlat = currentPlatform === 'Все' || item.platform === currentPlatform;
                     const matchBrand = currentBrand === 'Все' || item.brand === currentBrand;
                     const matchText = !query ||
@@ -360,7 +420,7 @@ async def handle_index(request):
                         item.summary.toLowerCase().includes(query) ||
                         item.source.toLowerCase().includes(query) ||
                         item.source_label.toLowerCase().includes(query);
-                    return matchPlat && matchBrand && matchText;
+                    return matchFresh && matchPlat && matchBrand && matchText;
                 });
                 renderCards(filtered);
             }
@@ -369,7 +429,7 @@ async def handle_index(request):
                 const list = document.getElementById('news-list');
                 if (!items.length) {
                     list.innerHTML = `<div class="text-center py-14 text-slate-400 text-sm">${
-                        currentTab === 'saved' ? 'В избранном пока пусто' : 'Публикаций по выбранному фильтру пока нет'
+                        currentTab === 'saved' ? 'В избранном пока пусто' : 'Свежих публикаций по этому фильтру нет'
                     }</div>`;
                     return;
                 }
@@ -386,13 +446,16 @@ async def handle_index(request):
                     card.innerHTML = `
                         <div class="flex justify-between items-center mb-2 gap-2">
                             <span class="text-[11px] font-bold px-2.5 py-0.5 rounded-md truncate ${badgeClass}">
-                                ${isIG ? '📸' : '✈️'} ${item.source_label} (${item.source})
+                                ${isIG ? '📸' : '✈️'} ${item.source_label}
                             </span>
-                            <span class="text-[11px] font-medium px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 shrink-0">${item.brand}</span>
+                            <span class="text-[11px] font-medium text-slate-500 dark:text-slate-400 shrink-0">${item.time}</span>
                         </div>
                         <h2 class="font-bold text-[15px] leading-snug mb-2.5">${item.title}</h2>
                         <div class="bg-slate-100 dark:bg-[#0b101b] p-3 rounded-xl mb-3 border-l-2 ${isIG ? 'border-pink-500' : 'border-sky-500'}">
-                            <div class="text-[11px] font-semibold ${isIG ? 'text-pink-400' : 'text-sky-400'} mb-1">⚡ Суть публикации</div>
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-[11px] font-semibold ${isIG ? 'text-pink-400' : 'text-sky-400'}">⚡ Суть публикации</span>
+                                <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400">${item.brand}</span>
+                            </div>
                             <p class="text-xs leading-relaxed text-slate-600 dark:text-slate-300">${item.summary}</p>
                         </div>
                         <div class="flex gap-2">
@@ -432,7 +495,7 @@ async def handle_api_refresh(request):
 async def periodic_updater():
     await refresh_all_news()
     while True:
-        await asyncio.sleep(1800)
+        await asyncio.sleep(900)  # Автообновление каждые 15 минут
         await refresh_all_news()
 
 async def start_web_server():
