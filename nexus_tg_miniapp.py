@@ -1,12 +1,18 @@
 import os
 import asyncio
+import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://nexus-miniapp.onrender.com")
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = (os.environ.get("BOT_TOKEN") or "").strip()
+WEBAPP_URL = (os.environ.get("WEBAPP_URL") or "https://nexus-miniapp-8ipk.onrender.com").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задана переменная окружения BOT_TOKEN!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -25,17 +31,26 @@ async def cmd_start(message: types.Message):
         web_app=types.WebAppInfo(url=WEBAPP_URL)
     ))
     await message.answer(
-        "Привет! Я твой ИИ-ассистент по техно-новостям. "
-        "Используй кнопку ниже, чтобы открыть умную веб-ленту.",
+        "Привет! Я твой ИИ-ассистент по техно-новостям.\n"
+        "Нажми на кнопку ниже, чтобы открыть умную веб-ленту:",
         reply_markup=builder.as_markup()
     )
 
 async def setup_bot_menu():
-    await bot.set_my_commands([
-        types.BotCommand(command="start", description="Запустить бота"),
-    ])
-    menu_button = types.MenuButtonWebApp(text="Открыть ленту", web_app=types.WebAppInfo(url=WEBAPP_URL))
-    await bot.set_chat_menu_button(menu_button=menu_button)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_my_commands([
+            types.BotCommand(command="start", description="Запустить бота"),
+        ])
+        if WEBAPP_URL.startswith("https://"):
+            menu_button = types.MenuButtonWebApp(
+                text="Открыть ленту",
+                web_app=types.WebAppInfo(url=WEBAPP_URL)
+            )
+            await bot.set_chat_menu_button(menu_button=menu_button)
+        logging.info("Меню бота успешно настроено. WEBAPP_URL=%s", WEBAPP_URL)
+    except Exception as e:
+        logging.warning("Не удалось настроить кнопку меню (продолжаем работу): %s", e)
 
 async def handle_index(request):
     html_content = """
@@ -128,13 +143,24 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+    logging.info("Веб-сервер запущен на порту %s", port)
+
+async def run_bot_polling():
+    await asyncio.sleep(3)
+    await setup_bot_menu()
+    while True:
+        try:
+            await dp.start_polling(bot, handle_signals=False)
+        except Exception as e:
+            logging.error("Ошибка polling (перезапуск через 5 сек): %s", e)
+            await asyncio.sleep(5)
 
 async def main():
-    await setup_bot_menu()
     await asyncio.gather(
         start_web_server(),
-        dp.start_polling(bot)
+        run_bot_polling()
     )
 
 if __name__ == '__main__':
     asyncio.run(main())
+
